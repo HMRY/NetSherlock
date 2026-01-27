@@ -68,8 +68,6 @@ statistical_features = [
     ('bwd_payload_q3', 'float', '后向载荷第三四分位数', '后向载荷的75%分位数', ''),
     ('bwd_payload_skew', 'float', '后向载荷偏度', '后向载荷的偏度系数', ''),
     ('bwd_payload_kurt', 'float', '后向载荷峰度', '后向载荷的峰度系数', ''),
-    ('packets_per_sec', 'float', '每秒包数', '总包数/流持续时间', ''),
-    ('bytes_per_sec', 'float', '每秒字节数', '总字节数/流持续时间', ''),
     
     # 时间间隔统计
     ('iat_mean', 'float', '时间间隔均值', '相邻数据包时间间隔的平均值', '单位：秒'),
@@ -345,6 +343,16 @@ sequence_features = [
     ('top_5_bigram_LL_freq', 'float', 'Top5二元组LL频率', '第五常见二元组LL的出现频率', 'S=小包,M=中包,L=大包'),
     ('ar_prediction_mse', 'float', 'AR模型预测均方误差', '自回归模型预测包长的均方误差', ''),
     ('ar_prediction_mae', 'float', 'AR模型预测平均绝对误差', '自回归模型预测包长的平均绝对误差', ''),
+    
+    # 原始序列特征（逗号分隔的字符串，最长100个元素）
+    ('packet_length_seq', 'string', '包长序列', '包长原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，单位：字节'),
+    ('packet_length_seq_len', 'int', '包长序列长度', '包长原始序列的实际长度', '最长100'),
+    ('packet_iat_seq', 'string', '包间隔序列', '包间隔原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，单位：秒'),
+    ('packet_iat_seq_len', 'int', '包间隔序列长度', '包间隔原始序列的实际长度', '最长100'),
+    ('packet_direction_seq', 'string', '包方向序列', '包方向原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，1=前向，-1=后向，0=未知'),
+    ('packet_direction_seq_len', 'int', '包方向序列长度', '包方向原始序列的实际长度', '最长100'),
+    ('packet_burst_seq', 'string', 'Burst序列', 'Burst原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，TCP=同ACK包总长，UDP=连续同方向包总长，单位：字节'),
+    ('packet_burst_seq_len', 'int', 'Burst序列长度', 'Burst原始序列的实际长度', '最长100'),
 ]
 
 features.extend([('序列特征',) + f for f in sequence_features])
@@ -516,10 +524,10 @@ features.extend([('协议头部特征',) + f for f in protocol_features])
 # ========== 行为特征 (BehavioralFeatureExtractor) ==========
 behavioral_features = [
     # 主机层面行为
-    ('host_as_client_flow_count', 'int', '主机作为客户端流数', '该主机作为客户端的流数量', ''),
-    ('client_dst_ip_diversity', 'int', '客户端目标IP多样性', '客户端连接的不同目标IP数量', ''),
-    ('client_dst_port_diversity', 'int', '客户端目标端口多样性', '客户端连接的不同目标端口数量', ''),
-    ('host_as_server_flow_count', 'int', '主机作为服务器流数', '该主机作为服务器的流数量', ''),
+    ('host_as_client_flow_count', 'int', '主机作为客户端流数', '该主机作为客户端的流数量', '多流聚合特征'),
+    ('client_dst_ip_diversity', 'int', '客户端目标IP多样性', '客户端连接的不同目标IP数量', '多流聚合特征'),
+    ('client_dst_port_diversity', 'int', '客户端目标端口多样性', '客户端连接的不同目标端口数量', '多流聚合特征'),
+    ('host_as_server_flow_count', 'int', '主机作为服务器流数', '该主机作为服务器的流数量', '多流聚合特征'),
     ('src_port_range', 'string', '源端口范围', '源端口所属范围类别', 'well_known/registered/dynamic'),
     
     # 扫描与探测行为
@@ -556,7 +564,33 @@ behavioral_features = [
     ('icmp_packet_count', 'int', 'ICMP包数', 'ICMP数据包总数', ''),
 ]
 
-features.extend([('行为特征',) + f for f in behavioral_features])
+# 分离单流特征和多流聚合特征
+single_flow_features = []
+multi_flow_features = []
+
+# 行为特征中的多流聚合特征
+behavioral_multi_flow_keys = ['host_as_client_flow_count', 'client_dst_ip_diversity', 
+                              'client_dst_port_diversity', 'host_as_server_flow_count']
+
+# 将行为特征分为单流和多流
+behavioral_single_flow = []
+behavioral_multi_flow = []
+for f in behavioral_features:
+    feature_name = f[0]
+    if feature_name in behavioral_multi_flow_keys:
+        behavioral_multi_flow.append(f)
+    else:
+        behavioral_single_flow.append(f)
+
+# 单流特征：统计、序列、载荷、协议头部、行为特征（除多流聚合部分）
+single_flow_features.extend([('统计特征',) + f for f in statistical_features])
+single_flow_features.extend([('序列特征',) + f for f in sequence_features])
+single_flow_features.extend([('载荷特征',) + f for f in payload_features])
+single_flow_features.extend([('协议头部特征',) + f for f in protocol_features])
+single_flow_features.extend([('行为特征',) + f for f in behavioral_single_flow])
+
+# 多流聚合特征：行为特征中的多流部分 + 图特征
+multi_flow_features.extend([('行为特征',) + f for f in behavioral_multi_flow])
 
 # ========== 图特征 (GraphFeatureExtractor) ==========
 graph_features = [
@@ -587,27 +621,44 @@ graph_features = [
     ('synchronized_flows_count', 'int', '同步流数', '在1秒内同时开始的其他流数量', ''),
 ]
 
-features.extend([('图特征',) + f for f in graph_features])
+multi_flow_features.extend([('图特征',) + f for f in graph_features])
 
-# ========== 其他特征 ==========
-other_features = [
-    ('flow_key', 'string', '流键', '流的五元组标识', ''),
-    ('packet_count', 'int', '数据包数', '流中的数据包总数', ''),
-]
-
-features.extend([('其他特征',) + f for f in other_features])
-
-# 写入CSV文件
-output_file = 'network_flow_features_description.csv'
-
-with open(output_file, 'w', newline='', encoding='utf-8-sig') as f:
+# 写入单流特征CSV文件
+single_flow_output_file = 'network_flow_features_single_flow.csv'
+with open(single_flow_output_file, 'w', newline='', encoding='utf-8-sig') as f:
     writer = csv.writer(f)
     # 写入表头
     writer.writerow(['特征分类', '特征字段名', '字段类型', '字段含义', '字段示意', '备注'])
     
     # 写入特征数据
-    for feature in features:
+    for feature in single_flow_features:
         writer.writerow(feature)
 
-print(f"特征描述文件已生成: {output_file}")
-print(f"总共包含 {len(features)} 个特征")
+print(f"单流特征描述文件已生成: {single_flow_output_file}")
+print(f"单流特征总共包含 {len(single_flow_features)} 个特征")
+
+# 写入多流聚合特征CSV文件
+multi_flow_output_file = 'network_flow_features_multi_flow.csv'
+with open(multi_flow_output_file, 'w', newline='', encoding='utf-8-sig') as f:
+    writer = csv.writer(f)
+    # 写入表头
+    writer.writerow(['特征分类', '特征字段名', '字段类型', '字段含义', '字段示意', '备注'])
+    
+    # 写入特征数据
+    for feature in multi_flow_features:
+        writer.writerow(feature)
+
+print(f"多流聚合特征描述文件已生成: {multi_flow_output_file}")
+print(f"多流聚合特征总共包含 {len(multi_flow_features)} 个特征")
+
+# 同时生成合并版本（兼容旧代码）
+all_features = single_flow_features + multi_flow_features
+output_file = 'network_flow_features_description.csv'
+with open(output_file, 'w', newline='', encoding='utf-8-sig') as f:
+    writer = csv.writer(f)
+    writer.writerow(['特征分类', '特征字段名', '字段类型', '字段含义', '字段示意', '备注'])
+    for feature in all_features:
+        writer.writerow(feature)
+
+print(f"合并特征描述文件已生成: {output_file}")
+print(f"总共包含 {len(all_features)} 个特征")

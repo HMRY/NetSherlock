@@ -281,10 +281,7 @@ class StatisticalFeatureExtractor(BaseFeatureExtractor):
         for stat_name, stat_value in bwd_payload_stats.items():
             self._add_feature(f'bwd_payload_{stat_name}', stat_value)
         
-        # 每秒包数/字节数
-        if self.features.get('flow_duration', 0) > 0:
-            self._add_feature('packets_per_sec', total_packets / self.features['flow_duration'])
-            self._add_feature('bytes_per_sec', total_bytes / self.features['flow_duration'])
+        # 每秒包数/字节数（已由avg_packet_rate和avg_throughput替代，此处删除避免重复）
     
     def _extract_time_interval_stats(self, all_pkts: List[PacketInfo],
                                     fwd_pkts: List[PacketInfo],
@@ -543,6 +540,9 @@ class SequenceFeatureExtractor(BaseFeatureExtractor):
         
         # 5. 序列建模特征
         self._extract_sequence_modeling_features(packets, forward_packets, backward_packets)
+        
+        # 6. 原始序列特征（包长、包间隔、包方向、burst）
+        self._extract_raw_sequences(packets, flow_key)
         
         return self.features
     
@@ -843,6 +843,133 @@ class SequenceFeatureExtractor(BaseFeatureExtractor):
                 self._add_feature('ar_prediction_mae', np.mean(np.abs(y - predictions)))
             except:
                 pass
+    
+    def _extract_raw_sequences(self, packets: List[PacketInfo], flow_key: Tuple):
+        """提取原始序列特征（包长、包间隔、包方向、burst）"""
+        if not packets:
+            return
+        
+        max_seq_len = 100
+        
+        # 1. 包长序列（原始序列，最长100）
+        packet_lengths = [p.packet_length for p in packets]
+        packet_lengths_seq = packet_lengths[:max_seq_len]
+        # 转换为逗号分隔的字符串
+        packet_lengths_str = ','.join(str(x) for x in packet_lengths_seq)
+        self._add_feature('packet_length_seq', packet_lengths_str)
+        self._add_feature('packet_length_seq_len', len(packet_lengths_seq))
+        
+        # 2. 包间隔序列（原始序列，最长100）
+        iat_sequence = []
+        for i in range(1, len(packets)):
+            iat = packets[i].timestamp - packets[i-1].timestamp
+            iat_sequence.append(iat)
+        
+        iat_sequence = iat_sequence[:max_seq_len]
+        # 转换为逗号分隔的字符串
+        iat_sequence_str = ','.join(str(x) for x in iat_sequence)
+        self._add_feature('packet_iat_seq', iat_sequence_str)
+        self._add_feature('packet_iat_seq_len', len(iat_sequence))
+        
+        # 3. 包方向序列（原始序列，最长100）
+        # 方向序列（1: 前向, -1: 后向, 0: 未知）
+        direction_sequence = []
+        for pkt in packets:
+            direction = pkt.get_direction(flow_key)
+            if direction == FlowDirection.FORWARD:
+                direction_sequence.append(1)
+            elif direction == FlowDirection.BACKWARD:
+                direction_sequence.append(-1)
+            else:
+                direction_sequence.append(0)
+        
+        direction_sequence = direction_sequence[:max_seq_len]
+        # 转换为逗号分隔的字符串
+        direction_sequence_str = ','.join(str(x) for x in direction_sequence)
+        self._add_feature('packet_direction_seq', direction_sequence_str)
+        self._add_feature('packet_direction_seq_len', len(direction_sequence))
+        
+        # 4. Burst序列
+        # TCP: 同ACK的包总长序列
+        # UDP: 连续同方向包总长序列
+        if packets and packets[0].protocol == ProtocolType.TCP:
+            burst_sequence = self._extract_tcp_burst_sequence(packets, flow_key, max_seq_len)
+        elif packets and packets[0].protocol == ProtocolType.UDP:
+            burst_sequence = self._extract_udp_burst_sequence(packets, flow_key, max_seq_len)
+        else:
+            burst_sequence = []
+        
+        # 转换为逗号分隔的字符串
+        burst_sequence_str = ','.join(str(x) for x in burst_sequence)
+        self._add_feature('packet_burst_seq', burst_sequence_str)
+        self._add_feature('packet_burst_seq_len', len(burst_sequence))
+    
+    def _extract_tcp_burst_sequence(self, packets: List[PacketInfo], flow_key: Tuple, max_len: int) -> List[int]:
+        """提取TCP burst序列：同ACK的包总长序列"""
+        if not packets:
+            return []
+        
+        burst_sequence = []
+        current_ack = None
+        current_burst_total = 0
+        
+        for pkt in packets:
+            if pkt.protocol != ProtocolType.TCP or pkt.tcp_ack is None:
+                continue
+            
+            # 如果ACK号相同，累加包长
+            if pkt.tcp_ack == current_ack:
+                current_burst_total += pkt.packet_length
+            else:
+                # ACK号改变，保存当前burst并开始新的burst
+                if current_ack is not None:
+                    burst_sequence.append(current_burst_total)
+                    if len(burst_sequence) >= max_len:
+                        break
+                
+                current_ack = pkt.tcp_ack
+                current_burst_total = pkt.packet_length
+        
+        # 添加最后一个burst
+        if current_ack is not None and len(burst_sequence) < max_len:
+            burst_sequence.append(current_burst_total)
+        
+        return burst_sequence[:max_len]
+    
+    def _extract_udp_burst_sequence(self, packets: List[PacketInfo], flow_key: Tuple, max_len: int) -> List[int]:
+        """提取UDP burst序列：连续同方向包总长序列"""
+        if not packets:
+            return []
+        
+        burst_sequence = []
+        current_direction = None
+        current_burst_total = 0
+        
+        for pkt in packets:
+            if pkt.protocol != ProtocolType.UDP:
+                continue
+            
+            direction = pkt.get_direction(flow_key)
+            direction_value = 1 if direction == FlowDirection.FORWARD else (-1 if direction == FlowDirection.BACKWARD else 0)
+            
+            # 如果方向相同，累加包长
+            if direction_value == current_direction:
+                current_burst_total += pkt.packet_length
+            else:
+                # 方向改变，保存当前burst并开始新的burst
+                if current_direction is not None:
+                    burst_sequence.append(current_burst_total)
+                    if len(burst_sequence) >= max_len:
+                        break
+                
+                current_direction = direction_value
+                current_burst_total = pkt.packet_length
+        
+        # 添加最后一个burst
+        if current_direction is not None and len(burst_sequence) < max_len:
+            burst_sequence.append(current_burst_total)
+        
+        return burst_sequence[:max_len]
 
 # ========== 载荷特征提取器 ==========
 
@@ -1425,7 +1552,7 @@ class BehavioralFeatureExtractor(BaseFeatureExtractor):
         src_ip = first_pkt.src_ip
         dst_ip = first_pkt.dst_ip
         
-        # 检查主机在host_flows_dict中的行为
+        # 检查主机在host_flows_dict中的行为（多流聚合特征）
         if self.host_flows_dict:
             # 作为客户端的行为
             if src_ip in self.host_flows_dict:
@@ -1447,7 +1574,7 @@ class BehavioralFeatureExtractor(BaseFeatureExtractor):
                 server_flows = self.host_flows_dict[dst_ip]
                 self._add_feature('host_as_server_flow_count', len(server_flows))
         
-        # 源端口范围特征
+        # 源端口范围特征（单流特征）
         src_port = first_pkt.src_port
         if 0 <= src_port <= 1023:
             self._add_feature('src_port_range', 'well_known')
@@ -2062,13 +2189,21 @@ class NetworkFlowFeatureExtractor:
         
         logger.info(f"识别出 {len(self.flows)} 个流")
         
-        # 为图特征提取器设置所有流
+        # 为图特征提取器设置所有流（用于多流聚合特征）
         self.graph_extractor.all_flows = self.flows
-        # 为行为特征提取器设置主机流字典
+        # 为行为特征提取器设置主机流字典（用于多流聚合特征）
         self.behavior_extractor.host_flows_dict = self.host_flows
     
-    def extract_flow_features(self, flow_key):
-        """提取单个流的特征"""
+    def extract_flow_features(self, flow_key, include_multi_flow=True):
+        """提取单个流的特征
+        
+        Args:
+            flow_key: 流标识键
+            include_multi_flow: 是否包含多流聚合特征
+        
+        Returns:
+            dict: 包含单流特征和多流特征（如果include_multi_flow=True）的字典
+        """
         if flow_key not in self.flows:
             logger.warning(f"流不存在: {flow_key}")
             return None
@@ -2078,32 +2213,79 @@ class NetworkFlowFeatureExtractor:
         # 按时间排序
         packets.sort(key=lambda x: x.timestamp)
         
-        # 提取各维度特征
+        # 提取单流特征（不需要多流聚合）
         stat_features = self.stat_extractor.extract(packets, flow_key)
         seq_features = self.seq_extractor.extract(packets, flow_key)
         payload_features = self.payload_extractor.extract(packets)
         protocol_features = self.protocol_extractor.extract(packets)
-        behavior_features = self.behavior_extractor.extract(packets, flow_key)
-        graph_features = self.graph_extractor.extract(packets, flow_key)
         
-        # 合并所有特征
-        all_features = {}
-        all_features.update(stat_features)
-        all_features.update(seq_features)
-        all_features.update(payload_features)
-        all_features.update(protocol_features)
-        all_features.update(behavior_features)
-        all_features.update(graph_features)
+        # 合并单流特征
+        single_flow_features = {}
+        single_flow_features.update(stat_features)
+        single_flow_features.update(seq_features)
+        single_flow_features.update(payload_features)
+        single_flow_features.update(protocol_features)
         
-        # 添加流标识信息
-        all_features['flow_key'] = str(flow_key)
-        all_features['packet_count'] = len(packets)
-        
-        return all_features
+        # 提取多流聚合特征（如果需要）
+        if include_multi_flow:
+            behavior_features = self.behavior_extractor.extract(packets, flow_key)
+            graph_features = self.graph_extractor.extract(packets, flow_key)
+            
+            # 分离单流和多流特征
+            multi_flow_features = {}
+            
+            # 行为特征中的多流聚合特征
+            multi_flow_keys = ['host_as_client_flow_count', 'client_dst_ip_diversity', 
+                             'client_dst_port_diversity', 'host_as_server_flow_count']
+            for key in multi_flow_keys:
+                if key in behavior_features:
+                    multi_flow_features[key] = behavior_features.pop(key)
+            
+            # 行为特征中的单流特征保留在single_flow_features中
+            single_flow_features.update(behavior_features)
+            
+            # 图特征都是多流聚合特征
+            multi_flow_features.update(graph_features)
+            
+            # 合并所有特征
+            all_features = {}
+            all_features.update(single_flow_features)
+            all_features.update(multi_flow_features)
+            
+            return {
+                'single_flow': single_flow_features,
+                'multi_flow': multi_flow_features,
+                'all': all_features
+            }
+        else:
+            # 只提取单流特征
+            behavior_features = self.behavior_extractor.extract(packets, flow_key)
+            # 移除多流聚合特征
+            multi_flow_keys = ['host_as_client_flow_count', 'client_dst_ip_diversity', 
+                             'client_dst_port_diversity', 'host_as_server_flow_count']
+            for key in multi_flow_keys:
+                behavior_features.pop(key, None)
+            
+            single_flow_features.update(behavior_features)
+            
+            return {
+                'single_flow': single_flow_features,
+                'multi_flow': {},
+                'all': single_flow_features
+            }
     
-    def extract_all_flows(self, max_flows=None):
-        """提取所有流的特征"""
-        self.all_features = []
+    def extract_all_flows(self, max_flows=None, include_multi_flow=True):
+        """提取所有流的特征
+        
+        Args:
+            max_flows: 最大处理流数
+            include_multi_flow: 是否包含多流聚合特征
+        
+        Returns:
+            dict: 包含'single_flow_features'和'multi_flow_features'的字典
+        """
+        single_flow_features_list = []
+        multi_flow_features_list = []
         
         flow_keys = list(self.flows.keys())
         if max_flows:
@@ -2111,35 +2293,59 @@ class NetworkFlowFeatureExtractor:
         
         logger.info(f"开始提取 {len(flow_keys)} 个流的特征...")
         
-        # 首先构建图（用于图特征提取）
-        logger.info("构建主机关系图...")
-        self.graph_extractor.build_host_graph()
+        # 构建图（用于多流聚合特征）
+        if include_multi_flow:
+            logger.info("构建主机关系图...")
+            self.graph_extractor.build_host_graph()
         
         # 提取每个流的特征
         for i, flow_key in enumerate(flow_keys):
             if (i + 1) % 10 == 0:
                 logger.info(f"处理进度: {i+1}/{len(flow_keys)}")
             
-            features = self.extract_flow_features(flow_key)
+            features = self.extract_flow_features(flow_key, include_multi_flow=include_multi_flow)
             if features:
-                self.all_features.append(features)
+                single_flow_features_list.append(features['single_flow'])
+                if include_multi_flow and features['multi_flow']:
+                    multi_flow_features_list.append(features['multi_flow'])
         
-        logger.info(f"成功提取 {len(self.all_features)} 个流的特征")
+        logger.info(f"成功提取 {len(single_flow_features_list)} 个流的单流特征")
+        if include_multi_flow:
+            logger.info(f"成功提取 {len(multi_flow_features_list)} 个流的多流聚合特征")
         
-        # 收集所有特征名称
+        # 保存到实例变量（兼容旧代码）- 合并单流和多流特征
+        self.all_features = []
+        for i, flow_key in enumerate(flow_keys):
+            single_feat = single_flow_features_list[i] if i < len(single_flow_features_list) else {}
+            multi_feat = multi_flow_features_list[i] if include_multi_flow and i < len(multi_flow_features_list) else {}
+            combined = {**single_feat, **multi_feat}
+            if combined:
+                self.all_features.append(combined)
+        
         if self.all_features:
             self.feature_names = list(self.all_features[0].keys())
         
-        return self.all_features
+        return {
+            'single_flow_features': single_flow_features_list,
+            'multi_flow_features': multi_flow_features_list if include_multi_flow else []
+        }
     
-    def save_features(self, output_file, format='csv'):
-        """保存特征到文件"""
-        if not self.all_features:
+    def save_features(self, output_file, format='csv', features_data=None):
+        """保存特征到文件
+        
+        Args:
+            output_file: 输出文件路径
+            format: 输出格式 ('csv', 'json', 'parquet')
+            features_data: 特征数据，如果为None则使用self.all_features
+        """
+        features_to_save = features_data if features_data is not None else self.all_features
+        
+        if not features_to_save:
             logger.warning("没有特征数据可保存")
             return False
         
         try:
-            df = pd.DataFrame(self.all_features)
+            df = pd.DataFrame(features_to_save)
             
             if format.lower() == 'csv':
                 df.to_csv(output_file, index=False)
@@ -2158,6 +2364,24 @@ class NetworkFlowFeatureExtractor:
         except Exception as e:
             logger.error(f"保存特征失败: {e}")
             return False
+    
+    def save_separated_features(self, single_flow_file, multi_flow_file, format='csv'):
+        """分别保存单流特征和多流聚合特征
+        
+        Args:
+            single_flow_file: 单流特征输出文件路径
+            multi_flow_file: 多流聚合特征输出文件路径
+            format: 输出格式
+        """
+        results = self.extract_all_flows(include_multi_flow=True)
+        
+        # 保存单流特征
+        if results['single_flow_features']:
+            self.save_features(single_flow_file, format, results['single_flow_features'])
+        
+        # 保存多流聚合特征
+        if results['multi_flow_features']:
+            self.save_features(multi_flow_file, format, results['multi_flow_features'])
     
     def get_feature_summary(self):
         """获取特征摘要"""
@@ -2224,9 +2448,9 @@ def main():
     
     # 提取特征
     print("开始提取特征...")
-    features = extractor.extract_all_flows(max_flows=args.max_flows)
+    results = extractor.extract_all_flows(max_flows=args.max_flows, include_multi_flow=True)
     
-    if not features:
+    if not results['single_flow_features']:
         print("特征提取失败或无特征可提取")
         return
     
@@ -2235,14 +2459,29 @@ def main():
     print(summary)
     
     # 保存特征
+    output_base = os.path.splitext(args.output)[0]
     output_ext = os.path.splitext(args.output)[1].lower()
     if not output_ext:
-        args.output = f"{args.output}.{args.format}"
+        output_ext = f".{args.format}"
     
-    if extractor.save_features(args.output, args.format):
-        print(f"特征已保存到: {args.output}")
+    # 保存单流特征
+    single_flow_output = f"{output_base}_single_flow{output_ext}"
+    if extractor.save_features(single_flow_output, args.format, results['single_flow_features']):
+        print(f"单流特征已保存到: {single_flow_output}")
     else:
-        print("特征保存失败")
+        print("单流特征保存失败")
+    
+    # 保存多流聚合特征
+    if results['multi_flow_features']:
+        multi_flow_output = f"{output_base}_multi_flow{output_ext}"
+        if extractor.save_features(multi_flow_output, args.format, results['multi_flow_features']):
+            print(f"多流聚合特征已保存到: {multi_flow_output}")
+        else:
+            print("多流聚合特征保存失败")
+    
+    # 同时保存合并版本（兼容旧代码）
+    if extractor.save_features(args.output, args.format):
+        print(f"合并特征已保存到: {args.output}")
 
 # ========== 使用示例 ==========
 
