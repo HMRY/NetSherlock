@@ -507,6 +507,24 @@ class StatisticalFeatureExtractor(BaseFeatureExtractor):
 
 class SequenceFeatureExtractor(BaseFeatureExtractor):
     """序列特征提取器（约100个特征）"""
+
+    def __init__(self,
+                 udp_dl_chunk_split_mode: str = 'uplink_size',
+                 udp_uplink_boundary_size: int = 100,
+                 udp_iat_boundary_seconds: float = 0.1,
+                 time_bin_size_seconds: float = 0.05):
+        """
+        UDP下行chunk切分配置：
+        - udp_dl_chunk_split_mode:
+            - 'uplink_size': 遇到“上行包长 > udp_uplink_boundary_size”作为chunk边界
+            - 'iat': 下行包之间 IAT(秒) > udp_iat_boundary_seconds 作为chunk边界
+        """
+        super().__init__()
+        self.udp_dl_chunk_split_mode = udp_dl_chunk_split_mode
+        self.udp_uplink_boundary_size = udp_uplink_boundary_size
+        self.udp_iat_boundary_seconds = udp_iat_boundary_seconds
+        # 速率序列时间单位（秒），默认50ms
+        self.time_bin_size_seconds = time_bin_size_seconds if time_bin_size_seconds and time_bin_size_seconds > 0 else 0.05
     
     def extract(self, packets: List[PacketInfo], flow_key: Tuple) -> Dict[str, Any]:
         """提取序列特征"""
@@ -541,10 +559,65 @@ class SequenceFeatureExtractor(BaseFeatureExtractor):
         # 5. 序列建模特征
         self._extract_sequence_modeling_features(packets, forward_packets, backward_packets)
         
-        # 6. 原始序列特征（包长、包间隔、包方向、burst）
+        # 6. 流速率序列特征（按时间窗口聚合）
+        self._extract_rate_sequences(packets, flow_key)
+
+        # 7. 原始序列特征（包长、包间隔、包方向、下行chunk）
         self._extract_raw_sequences(packets, flow_key)
         
         return self.features
+
+    def _extract_rate_sequences(self, packets: List[PacketInfo], flow_key: Tuple):
+        """提取单位时间内上下行传输字节数序列（流速率曲线）"""
+        if not packets:
+            return
+
+        max_seq_len = 100
+        bin_size = self.time_bin_size_seconds if self.time_bin_size_seconds and self.time_bin_size_seconds > 0 else 0.05
+
+        start_ts = packets[0].timestamp
+        uplink_bins: Dict[int, int] = {}
+        downlink_bins: Dict[int, int] = {}
+
+        for pkt in packets:
+            # 仅考虑有意义的时间戳
+            if pkt.timestamp is None:
+                continue
+
+            # 以首包时间为0起点
+            delta_t = pkt.timestamp - start_ts
+            if delta_t < 0:
+                continue
+
+            bin_idx = int(delta_t // bin_size)
+
+            direction = pkt.get_direction(flow_key)
+            if direction == FlowDirection.FORWARD:
+                uplink_bins[bin_idx] = uplink_bins.get(bin_idx, 0) + pkt.packet_length
+            elif direction == FlowDirection.BACKWARD:
+                downlink_bins[bin_idx] = downlink_bins.get(bin_idx, 0) + pkt.packet_length
+
+        if not uplink_bins and not downlink_bins:
+            return
+
+        max_bin_idx = 0
+        if uplink_bins:
+            max_bin_idx = max(max_bin_idx, max(uplink_bins.keys()))
+        if downlink_bins:
+            max_bin_idx = max(max_bin_idx, max(downlink_bins.keys()))
+
+        seq_len = min(max_seq_len, max_bin_idx + 1)
+
+        uplink_seq = [uplink_bins.get(i, 0) for i in range(seq_len)]
+        downlink_seq = [downlink_bins.get(i, 0) for i in range(seq_len)]
+
+        uplink_seq_str = ','.join(str(x) for x in uplink_seq)
+        downlink_seq_str = ','.join(str(x) for x in downlink_seq)
+
+        self._add_feature('uplink_rate_seq', uplink_seq_str)
+        self._add_feature('uplink_rate_seq_len', len(uplink_seq))
+        self._add_feature('downlink_rate_seq', downlink_seq_str)
+        self._add_feature('downlink_rate_seq_len', len(downlink_seq))
     
     def _extract_packet_length_sequences(self, all_pkts: List[PacketInfo],
                                         fwd_pkts: List[PacketInfo],
@@ -845,7 +918,7 @@ class SequenceFeatureExtractor(BaseFeatureExtractor):
                 pass
     
     def _extract_raw_sequences(self, packets: List[PacketInfo], flow_key: Tuple):
-        """提取原始序列特征（包长、包间隔、包方向、burst）"""
+        """提取原始序列特征（包长、包间隔、包方向、下行chunk）"""
         if not packets:
             return
         
@@ -889,21 +962,122 @@ class SequenceFeatureExtractor(BaseFeatureExtractor):
         self._add_feature('packet_direction_seq', direction_sequence_str)
         self._add_feature('packet_direction_seq_len', len(direction_sequence))
         
-        # 4. Burst序列
-        # TCP: 同ACK的包总长序列
-        # UDP: 连续同方向包总长序列
+        # 4. 下行chunk序列（服务端->客户端）
+        # TCP: 根据ACK划分chunk（仅统计下行方向的数据包）
+        # UDP: 根据“存在大于100字节的上行包”划分chunk（仅统计下行方向的数据包）
         if packets and packets[0].protocol == ProtocolType.TCP:
-            burst_sequence = self._extract_tcp_burst_sequence(packets, flow_key, max_seq_len)
+            chunk_sequence = self._extract_tcp_dl_chunk_sequence(packets, flow_key, max_seq_len)
         elif packets and packets[0].protocol == ProtocolType.UDP:
-            burst_sequence = self._extract_udp_burst_sequence(packets, flow_key, max_seq_len)
+            chunk_sequence = self._extract_udp_dl_chunk_sequence(packets, flow_key, max_seq_len)
         else:
-            burst_sequence = []
-        
-        # 转换为逗号分隔的字符串
-        burst_sequence_str = ','.join(str(x) for x in burst_sequence)
-        self._add_feature('packet_burst_seq', burst_sequence_str)
-        self._add_feature('packet_burst_seq_len', len(burst_sequence))
+            chunk_sequence = []
+
+        chunk_sequence_str = ','.join(str(x) for x in chunk_sequence)
+        self._add_feature('dl_chunk_seq', chunk_sequence_str)
+        self._add_feature('dl_chunk_seq_len', len(chunk_sequence))
     
+    def _extract_tcp_dl_chunk_sequence(self, packets: List[PacketInfo], flow_key: Tuple, max_len: int) -> List[int]:
+        """提取TCP下行chunk序列：下行(服务端->客户端)方向按ACK划分chunk的包总长序列"""
+        if not packets:
+            return []
+
+        chunk_sequence: List[int] = []
+        current_ack = None
+        current_chunk_total = 0
+
+        for pkt in packets:
+            if pkt.protocol != ProtocolType.TCP or pkt.tcp_ack is None:
+                continue
+
+            # 仅统计下行方向（通常为BACKWARD，取决于flow_key首包方向）
+            if pkt.get_direction(flow_key) != FlowDirection.BACKWARD:
+                continue
+
+            if pkt.tcp_ack == current_ack:
+                current_chunk_total += pkt.packet_length
+            else:
+                if current_ack is not None:
+                    chunk_sequence.append(current_chunk_total)
+                    if len(chunk_sequence) >= max_len:
+                        break
+
+                current_ack = pkt.tcp_ack
+                current_chunk_total = pkt.packet_length
+
+        if current_ack is not None and len(chunk_sequence) < max_len:
+            chunk_sequence.append(current_chunk_total)
+
+        return chunk_sequence[:max_len]
+
+    def _extract_udp_dl_chunk_sequence(self, packets: List[PacketInfo], flow_key: Tuple, max_len: int) -> List[int]:
+        """提取UDP下行chunk序列（仅统计下行包），chunk分割方式可配置"""
+        if not packets:
+            return []
+
+        mode = (self.udp_dl_chunk_split_mode or 'uplink_size').strip().lower()
+        chunk_sequence: List[int] = []
+
+        # 方式1：上行包长阈值分割（默认）
+        if mode in ('uplink_size', 'uplink', 'uplink_packet_size', 'size'):
+            current_chunk_total = 0
+            threshold = int(self.udp_uplink_boundary_size) if self.udp_uplink_boundary_size is not None else 100
+
+            for pkt in packets:
+                if pkt.protocol != ProtocolType.UDP:
+                    continue
+
+                direction = pkt.get_direction(flow_key)
+
+                # 上行(客户端->服务端)且包长超过阈值：作为chunk边界
+                if direction == FlowDirection.FORWARD and pkt.packet_length > threshold:
+                    if current_chunk_total > 0:
+                        chunk_sequence.append(current_chunk_total)
+                        if len(chunk_sequence) >= max_len:
+                            return chunk_sequence[:max_len]
+                        current_chunk_total = 0
+                    continue
+
+                # 仅统计下行方向
+                if direction == FlowDirection.BACKWARD:
+                    current_chunk_total += pkt.packet_length
+
+            if current_chunk_total > 0 and len(chunk_sequence) < max_len:
+                chunk_sequence.append(current_chunk_total)
+
+            return chunk_sequence[:max_len]
+
+        # 方式2：按下行包IAT时间间隔分割
+        if mode in ('iat', 'time', 'time_gap', 'interval'):
+            current_chunk_total = 0
+            prev_dl_ts: Optional[float] = None
+            gap = float(self.udp_iat_boundary_seconds) if self.udp_iat_boundary_seconds is not None else 0.1
+
+            for pkt in packets:
+                if pkt.protocol != ProtocolType.UDP:
+                    continue
+
+                if pkt.get_direction(flow_key) != FlowDirection.BACKWARD:
+                    continue
+
+                if prev_dl_ts is not None and (pkt.timestamp - prev_dl_ts) > gap:
+                    if current_chunk_total > 0:
+                        chunk_sequence.append(current_chunk_total)
+                        if len(chunk_sequence) >= max_len:
+                            return chunk_sequence[:max_len]
+                        current_chunk_total = 0
+
+                current_chunk_total += pkt.packet_length
+                prev_dl_ts = pkt.timestamp
+
+            if current_chunk_total > 0 and len(chunk_sequence) < max_len:
+                chunk_sequence.append(current_chunk_total)
+
+            return chunk_sequence[:max_len]
+
+        # 未知模式：退化为默认
+        self.udp_dl_chunk_split_mode = 'uplink_size'
+        return self._extract_udp_dl_chunk_sequence(packets, flow_key, max_len)
+
     def _extract_tcp_burst_sequence(self, packets: List[PacketInfo], flow_key: Tuple, max_len: int) -> List[int]:
         """提取TCP burst序列：同ACK的包总长序列"""
         if not packets:
@@ -2014,7 +2188,12 @@ class GraphFeatureExtractor(BaseFeatureExtractor):
 class NetworkFlowFeatureExtractor:
     """网络流量特征提取主类"""
     
-    def __init__(self, pcap_file=None):
+    def __init__(self,
+                 pcap_file=None,
+                 udp_dl_chunk_split_mode: str = 'uplink_size',
+                 udp_uplink_boundary_size: int = 100,
+                 udp_iat_boundary_seconds: float = 0.1,
+                 rate_time_unit_seconds: float = 0.05):
         self.pcap_file = pcap_file
         self.packets = []
         self.flows = {}
@@ -2022,7 +2201,12 @@ class NetworkFlowFeatureExtractor:
         
         # 初始化各个特征提取器
         self.stat_extractor = StatisticalFeatureExtractor()
-        self.seq_extractor = SequenceFeatureExtractor()
+        self.seq_extractor = SequenceFeatureExtractor(
+            udp_dl_chunk_split_mode=udp_dl_chunk_split_mode,
+            udp_uplink_boundary_size=udp_uplink_boundary_size,
+            udp_iat_boundary_seconds=udp_iat_boundary_seconds,
+            time_bin_size_seconds=rate_time_unit_seconds
+        )
         self.payload_extractor = PayloadFeatureExtractor()
         self.protocol_extractor = ProtocolHeaderFeatureExtractor()
         self.behavior_extractor = BehavioralFeatureExtractor()
@@ -2425,6 +2609,26 @@ def main():
     parser.add_argument('-m', '--max-flows', type=int, default=None, 
                        help='最大处理流数 (None表示处理所有流)')
     parser.add_argument('-v', '--verbose', action='store_true', help='显示详细日志')
+
+    # UDP下行chunk序列参数（dl_chunk_seq）
+    parser.add_argument('--udp-dl-chunk-split-mode',
+                        default='uplink_size',
+                        choices=['uplink_size', 'iat'],
+                        help="UDP下行chunk分割方式：'uplink_size'(默认，按上行大包分界) 或 'iat'(按下行包间隔分界)")
+    parser.add_argument('--udp-dl-chunk-uplink-threshold',
+                        type=int,
+                        default=100,
+                        help='uplink_size模式下：上行包长阈值(字节)，上行包长>阈值触发chunk分割（默认100）')
+    parser.add_argument('--udp-dl-chunk-iat-threshold',
+                        type=float,
+                        default=0.1,
+                        help='iat模式下：下行包IAT阈值(秒)，IAT>阈值触发chunk分割（默认0.1）')
+
+    # 流速率序列时间单位配置
+    parser.add_argument('--rate-time-unit-ms',
+                        type=float,
+                        default=50.0,
+                        help='流速率序列时间单位，毫秒(默认50ms)，用于计算上下行速率序列')
     
     args = parser.parse_args()
     
@@ -2439,7 +2643,13 @@ def main():
         return
     
     # 创建特征提取器
-    extractor = NetworkFlowFeatureExtractor(args.input)
+    extractor = NetworkFlowFeatureExtractor(
+        args.input,
+        udp_dl_chunk_split_mode=args.udp_dl_chunk_split_mode,
+        udp_uplink_boundary_size=args.udp_dl_chunk_uplink_threshold,
+        udp_iat_boundary_seconds=args.udp_dl_chunk_iat_threshold,
+        rate_time_unit_seconds=(args.rate_time_unit_ms / 1000.0 if args.rate_time_unit_ms else 0.05)
+    )
     
     # 加载pcap文件
     if not extractor.load_pcap():

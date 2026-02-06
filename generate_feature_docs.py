@@ -351,8 +351,14 @@ sequence_features = [
     ('packet_iat_seq_len', 'int', '包间隔序列长度', '包间隔原始序列的实际长度', '最长100'),
     ('packet_direction_seq', 'string', '包方向序列', '包方向原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，1=前向，-1=后向，0=未知'),
     ('packet_direction_seq_len', 'int', '包方向序列长度', '包方向原始序列的实际长度', '最长100'),
-    ('packet_burst_seq', 'string', 'Burst序列', 'Burst原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，TCP=同ACK包总长，UDP=连续同方向包总长，单位：字节'),
-    ('packet_burst_seq_len', 'int', 'Burst序列长度', 'Burst原始序列的实际长度', '最长100'),
+    ('dl_chunk_seq', 'string', '下行chunk序列', '下行流量（服务端->客户端）的chunk原始序列，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素；TCP=下行按ACK划分chunk的包总长；UDP=chunk分割方式可配置(按上行大包阈值或按下行IAT阈值)；单位：字节'),
+    ('dl_chunk_seq_len', 'int', '下行chunk序列长度', '下行chunk原始序列的实际长度', '最长100'),
+    
+    # 流速率序列特征（按时间窗口聚合，默认50ms，可配置）
+    ('uplink_rate_seq', 'string', '上行速率序列', '单位时间内（可配置，默认50ms）上行传输数据字节数序列，流速率曲线，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，单位：字节/时间窗口'),
+    ('uplink_rate_seq_len', 'int', '上行速率序列长度', '上行速率序列的实际长度', '最长100'),
+    ('downlink_rate_seq', 'string', '下行速率序列', '单位时间内（可配置，默认50ms）下行传输数据字节数序列，流速率曲线，逗号分隔的字符串', '格式：数值1,数值2,...，最长100个元素，单位：字节/时间窗口'),
+    ('downlink_rate_seq_len', 'int', '下行速率序列长度', '下行速率序列的实际长度', '最长100'),
 ]
 
 features.extend([('序列特征',) + f for f in sequence_features])
