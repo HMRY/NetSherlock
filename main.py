@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 网络流量多维度特征提取系统
-支持从pcap文件提取统计特征、序列特征、载荷特征、协议头部特征、行为特征和关联特征
-总计超过570个特征项
+支持从pcap文件提取统计特征、序列特征、载荷特征、协议头部特征、行为特征等
+总计超过500个特征项
 """
 
 import sys
@@ -2530,6 +2530,33 @@ class NetworkFlowFeatureExtractor:
         
         try:
             df = pd.DataFrame(features_to_save)
+            
+            # 根据定义CSV文件中的顺序重新排列列（保证与network_flow_features_single_flow.csv等一致）
+            if format.lower() == 'csv':
+                try:
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                    single_spec_path = os.path.join(base_dir, 'network_flow_features_single_flow.csv')
+                    multi_spec_path = os.path.join(base_dir, 'network_flow_features_multi_flow.csv')
+                    
+                    spec_cols = None
+                    # 单流特征文件：按single_flow规范排序
+                    if os.path.exists(single_spec_path) and ('single_flow' in os.path.basename(output_file)):
+                        spec_df = pd.read_csv(single_spec_path)
+                        if '特征字段名' in spec_df.columns:
+                            spec_cols = spec_df['特征字段名'].tolist()
+                    # 多流聚合特征文件：按multi_flow规范排序
+                    elif os.path.exists(multi_spec_path) and ('multi_flow' in os.path.basename(output_file)):
+                        spec_df = pd.read_csv(multi_spec_path)
+                        if '特征字段名' in spec_df.columns:
+                            spec_cols = spec_df['特征字段名'].tolist()
+                    
+                    if spec_cols:
+                        ordered = [c for c in spec_cols if c in df.columns]
+                        remaining = [c for c in df.columns if c not in ordered]
+                        if ordered:
+                            df = df[ordered + remaining]
+                except Exception as e:
+                    logger.warning(f"按规范CSV重新排序特征列失败: {e}")
             
             if format.lower() == 'csv':
                 df.to_csv(output_file, index=False)
