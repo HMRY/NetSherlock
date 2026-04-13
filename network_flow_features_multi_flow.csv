@@ -1,4 +1,9 @@
-﻿特征分类,特征字段名,字段类型,字段含义,字段示意,备注
+﻿特征分类,特征字段名,字段类型,字段含义,字段示意,备注,备注,配置项,计算方式
+协议头部特征,unique_src_ports,int,唯一源端口数,流中唯一源端口数量,,,,首次计算
+协议头部特征,unique_dst_ports,int,唯一目标端口数,流中唯一目标端口数量,,,,首次计算
+协议头部特征,well_known_src_port_ratio,float,知名源端口比例,使用知名端口的源端口包数/总包数,,,,首次计算
+协议头部特征,well_known_dst_port_ratio,float,知名目标端口比例,使用知名端口的目标端口包数/总包数,,,,首次计算
+行为特征,short_connection_ratio,float,短连接比例,持续时间<2秒的连接占比,,,短连接持续时间阈值（默认2秒）,二次计算（基于flow_duration）
 行为特征,host_as_client_flow_count,int,主机作为客户端流数,该主机作为客户端的流数量,多流聚合特征
 行为特征,client_dst_ip_diversity,int,客户端目标IP多样性,客户端连接的不同目标IP数量,多流聚合特征
 行为特征,client_dst_port_diversity,int,客户端目标端口多样性,客户端连接的不同目标端口数量,多流聚合特征
